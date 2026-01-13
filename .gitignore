@@ -1,0 +1,55 @@
+*_backup/
+bot_backup/
+
+# Audio files (too large for GitHub)
+data/audio/
+*.wav
+*.mp3
+
+# Transcripts (generated files)
+data/transcripts/
+
+# Environment variables (contains secrets)
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+venv/
+env/
+
+# Node
+node_modules/
+npm-debug.log
+
+# Database
+*.db
+*.sqlite
+
+# Logs
+*.log
+bot.log
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Distribution packages (large zips)
+*.zip
+chronicle-bot-dist/
