@@ -53,3 +53,5 @@ desktop.ini
 # Distribution packages (large zips)
 *.zip
 chronicle-bot-dist/
+create_distribution*.ps1
+chronicle-bot-dist*.zip
