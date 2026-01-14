@@ -1,3 +1,11 @@
+# Create LICENSE file
+notepad LICENSE
+```
+
+**Paste this MIT License:**
+```
+MIT License
+
 Copyright (c) 2026 kartikdatla
 
 Permission is hereby granted, free of charge, to any person obtaining a copy

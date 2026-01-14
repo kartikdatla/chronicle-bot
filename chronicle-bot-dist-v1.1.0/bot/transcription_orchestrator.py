@@ -17,7 +17,6 @@ class TranscriptionOrchestrator:
     
     def __init__(self, db_pool):
         self.db = db_pool
-        self.progress_callback = None  # For progress tracking
         
         # Import here to avoid circular dependency
         from whisper_provider import WhisperProvider
@@ -55,9 +54,8 @@ class TranscriptionOrchestrator:
             # Transcribe each audio file
             all_segments = []
             succeeded = 0
-            total_files = len(audio_files)
             
-            for idx, audio_file in enumerate(audio_files, 1):
+            for audio_file in audio_files:
                 user_id = audio_file['user_id']
                 file_path = audio_file['file_path']
                 
@@ -66,17 +64,11 @@ class TranscriptionOrchestrator:
                     file_path = str(Path.cwd() / file_path)
                 
                 try:
-                    # Notify progress if callback exists
-                    if self.progress_callback:
-                        await self.progress_callback(idx, total_files, user_id, 'transcribing')
-                    
                     # Transcribe audio
                     text = await asyncio.to_thread(self.whisper.transcribe_audio, file_path)
                     
                     if not text or not text.strip():
                         logger.warning(f'Empty transcription for user {user_id}')
-                        if self.progress_callback:
-                            await self.progress_callback(idx, total_files, user_id, 'empty')
                         continue
                     
                     # Fix fantasy names
@@ -106,14 +98,8 @@ class TranscriptionOrchestrator:
                     succeeded += 1
                     logger.info(f'Transcribed audio for user {user_id}')
                     
-                    # Notify completion
-                    if self.progress_callback:
-                        await self.progress_callback(idx, total_files, user_id, 'completed')
-                    
                 except Exception as e:
                     logger.error(f'Failed to transcribe for user {user_id}: {e}', exc_info=True)
-                    if self.progress_callback:
-                        await self.progress_callback(idx, total_files, user_id, 'failed')
             
             # Sort all segments by timestamp
             all_segments.sort(key=lambda x: x['timestamp'])

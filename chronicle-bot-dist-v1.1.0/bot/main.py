@@ -104,10 +104,10 @@ async def on_ready():
         )
         logger.info('Database pool created')
         
-        # Initialize managers
+        # Initialize managers - COMPATIBLE WITH EXISTING CODE
         session_manager = SessionManager(db_pool)
         voice_manager = VoiceManager(bot, session_manager, './data/audio')
-        transcription_orchestrator = TranscriptionOrchestrator(db_pool)
+        transcription_orchestrator = TranscriptionOrchestrator(db_pool)  # Only db_pool
         transcript_formatter = TranscriptFormatter('./data/transcripts')
         summary_generator = SummaryGenerator('llama3.2:3b', './data/transcripts')
         
@@ -258,7 +258,6 @@ async def transcribe_cmd(ctx: discord.ApplicationContext):
     await ctx.defer()
     
     try:
-        # Get most recent completed session
         async with session_manager.db.acquire() as conn:
             session = await conn.fetchrow('''
                 SELECT id, name FROM sessions
@@ -273,222 +272,105 @@ async def transcribe_cmd(ctx: discord.ApplicationContext):
         session_id = str(session['id'])
         session_name = session['name']
         
-        # Find audio folder (may have UUID appended)
-        audio_base = Path('./data/audio')
-        matching_folders = list(audio_base.glob(f'{session_id}*'))
-        
-        if not matching_folders:
-            await ctx.followup.send(f'❌ No audio folder found for session {session_id[:8]}')
-            return
-        
-        audio_folder = matching_folders[0]
-        audio_files = list(audio_folder.glob('*.wav'))
-        
-        if not audio_files:
-            await ctx.followup.send(f'❌ No audio files found in {audio_folder.name}')
-            return
-        
-        # Build user map for progress display
-        user_map = {}
-        for audio_file in audio_files:
-            username = audio_file.stem.rsplit('_', 2)[0]
-            user_id = hash(username) % (2**31)
-            member = ctx.guild.get_member(user_id)
-            user_map[user_id] = member.name if member else username
-        
-        # Update database with correct file paths
-        async with session_manager.db.acquire() as conn:
-            for audio_file in audio_files:
-                username = audio_file.stem.rsplit('_', 2)[0]
-                user_id = hash(username) % (2**31)
-                
-                await conn.execute('''
-                    UPDATE audio_files 
-                    SET file_path = $1 
-                    WHERE session_id = $2 AND user_id = $3
-                ''', str(audio_file), session_id, user_id)
-        
-        # Create progress message
         progress_msg = await ctx.followup.send(
             f'🔄 **Processing Session**\n'
             f'Name: {session_name or "Unnamed"}\n\n'
-            f'⏳ **Step 1/3: Transcribing audio**\n'
-            f'Preparing...'
+            f'⏳ Step 1/3: Transcribing audio...'
         )
         
-        # Progress tracking with rate limiting
-        import time
-        last_update = [0]
-        
-        async def update_progress(current, total, user_id, status):
-            """Update Discord message with progress bar"""
-            # Rate limit: only update every 2 seconds
-            current_time = time.time()
-            if current_time - last_update[0] < 2 and current < total:
-                return
-            
-            last_update[0] = current_time
-            
-            # Create progress bar
-            progress_percent = (current / total) * 100
-            filled = int(progress_percent / 5)
-            bar = '█' * filled + '░' * (20 - filled)
-            
-            # Get username
-            username = user_map.get(user_id, f'User {user_id}')
-            
-            # Status emoji
-            status_emoji = {
-                'transcribing': '⏳',
-                'completed': '✅',
-                'failed': '❌',
-                'empty': '⚠️'
-            }.get(status, '⏳')
-            
-            # Estimate time remaining
-            files_remaining = total - current
-            est_minutes = files_remaining * 3
-            
-            try:
-                await progress_msg.edit(
-                    content=f'🔄 **Processing Session**\n'
-                            f'Name: {session_name or "Unnamed"}\n\n'
-                            f'⏳ **Step 1/3: Transcribing audio**\n'
-                            f'```\n{bar}\n```\n'
-                            f'{current}/{total} files ({progress_percent:.0f}%)\n\n'
-                            f'{status_emoji} Currently: **{username}**\n'
-                            f'⏱️ Est. remaining: ~{est_minutes} min'
-                )
-            except:
-                pass
-        
-        # Set progress callback
-        transcription_orchestrator.progress_callback = update_progress
-        
-        # Step 1: Transcribe
+        # Transcribe
         segments = await transcription_orchestrator.transcribe_session(session_id)
         
-        # Clear callback
-        transcription_orchestrator.progress_callback = None
-        
         if not segments:
-            await progress_msg.edit(content='❌ Transcription failed - no audio segments found')
+            await progress_msg.edit(content='No audio found.')
             return
         
+        # Count unique users who actually spoke
         unique_users = len(set(seg['user_id'] for seg in segments))
         
         await progress_msg.edit(
             content=f'🔄 **Processing Session**\n'
-                    f'✅ Step 1/3: Transcribed {len(segments)} segments from {unique_users} participants\n'
-                    f'⏳ Step 2/3: Generating AI summary...'
+                    f'✅ Step 1/3: Transcribed {unique_users} participants\n'
+                    f'⏳ Step 2/3: Generating transcript document...'
         )
         
-        # Step 2: Get transcript data for summary
-        async with session_manager.db.acquire() as conn:
-            transcripts = await conn.fetch('''
-                SELECT tj.transcript_text, af.user_id
-                FROM transcription_jobs tj
-                JOIN audio_files af ON tj.audio_file_id = af.id
-                WHERE tj.session_id = $1
-                ORDER BY af.created_at
-            ''', session_id)
+      # Build transcript data and collect unique participants
+        user_names = {}
+        transcript_data = []
         
-        transcript_for_summary = [{
-            'speaker': f'User {t["user_id"]}',
-            'text': t['transcript_text']
-        } for t in transcripts]
-        
-        # Generate summary
-        output_dir = Path(f'./data/transcripts/{audio_folder.name}')
-        output_dir.mkdir(parents=True, exist_ok=True)
-        
-        try:
-            summarizer = SummaryGenerator('llama3.2:3b', str(output_dir))
-            summary_path = await summarizer.generate_summary(session_id, transcript_for_summary)
+        for seg in segments:
+            user_id = seg['user_id']
             
-            # Read the summary file
-            if isinstance(summary_path, (str, Path)):
-                summary_file = Path(summary_path)
-                if summary_file.exists():
-                    summary = summary_file.read_text(encoding='utf-8')
-                else:
-                    summary = "Summary file not found"
-            else:
-                summary = "Summary generation completed"
+            # Get username once per user (cache it)
+            if user_id not in user_names:
+                member = ctx.guild.get_member(user_id)
+                user_names[user_id] = member.name if member else f"User {user_id}"
             
-            summary_status = f'✅ Step 2/3: AI summary generated ({len(summary.split())} words)'
-        except Exception as e:
-            logger.error(f'AI summary failed: {e}', exc_info=True)
-            summary = "AI summary generation failed. See logs for details."
-            summary_status = '⚠️ Step 2/3: AI summary failed'
+            transcript_data.append({
+                'user_id': user_id,
+                'user_name': user_names[user_id],
+                'text': seg['text'],
+                'timestamp': seg.get('timestamp', 0)
+            })
+        
+        # Create unique, sorted participants list
+        participants = sorted(list(set(user_names.values())))
+        
+        # Create unique, sorted participants list
+        participants = sorted(list(set(user_names.values())))
+        
+        # Export transcript
+        transcript_path = await transcript_formatter.export_transcript(
+            session_id,
+            session_name,
+            transcript_data,
+            participants
+        )
         
         await progress_msg.edit(
             content=f'🔄 **Processing Session**\n'
                     f'✅ Step 1/3: Transcribed {unique_users} participants\n'
-                    f'{summary_status}\n'
-                    f'⏳ Step 3/3: Creating Word document...'
+                    f'✅ Step 2/3: Transcript document created\n'
+                    f'⏳ Step 3/3: Generating AI summary...'
         )
         
-        # Step 3: Create Word document
-        import json
-        import subprocess
+        # Generate AI summary
+        try:
+            summary_path = await summary_generator.generate_summary(
+                session_id,
+                transcript_data,
+                session_name
+            )
+            summary_status = '✅ Step 3/3: AI summary generated'
+        except Exception as e:
+            logger.error(f'AI summary failed: {e}')
+            summary_path = None
+            summary_status = '⚠️ Step 3/3: AI summary failed'
         
-        # Prepare export data
-        export_data = {
-            'sessionId': session_id,
-            'participants': sorted(list(set(user_map.values()))),
-            'transcript': [
-                {
-                    'speaker': user_map.get(seg['user_id'], f"User {seg['user_id']}").upper(),
-                    'text': seg['text'],
-                    'timestamp': seg.get('timestamp', 0)
-                }
-                for seg in segments
-            ],
-            'summary': summary
-        }
-        
-        # Save temp JSON
-        temp_json = output_dir / 'temp_export.json'
-        with open(temp_json, 'w', encoding='utf-8') as f:
-            json.dump(export_data, f, ensure_ascii=False, indent=2)
-        
-        # Call Node.js exporter
-        docx_path = output_dir / 'transcript.docx'
-        result = subprocess.run(
-            ['node', 'transcript_exporter.js', str(temp_json), str(docx_path)],
-            capture_output=True,
-            text=True,
-            cwd=str(Path.cwd())
-        )
-        
-        if result.returncode == 0:
-            temp_json.unlink()
-            doc_status = '✅ Step 3/3: Word document created'
-        else:
-            logger.error(f'Document creation failed: {result.stderr}')
-            doc_status = '⚠️ Step 3/3: Document creation failed'
-        
-        # Show preview
+        # Preview
         preview = '\n'.join([
-            f'**{user_map.get(seg["user_id"], "Unknown")}:** {seg["text"][:80]}{"..." if len(seg["text"]) > 80 else ""}'
-            for seg in segments[:3]
+            f'**{t["user_name"]}:** {t["text"][:80]}{"..." if len(t["text"]) > 80 else ""}'
+            for t in transcript_data[:2]
         ])
         
         result_message = (
             f'✅ **Processing Complete!**\n\n'
-            f'**Preview:**\n{preview}\n\n'
-            f'📄 **Files saved to:** `{output_dir}`\n'
-            f'• `transcript.docx` - Full transcript with timestamps\n'
-            f'• `summary.txt` - AI-generated recap\n'
+            f'{preview}\n\n'
+            f'📄 **Transcript:** `{transcript_path}`\n'
         )
         
+        if summary_path:
+            result_message += f'📖 **Summary:** `{summary_path}`\n'
+        
+        result_message += f'\n💾 Files saved to: `data/transcripts/{session_id[:8]}...`'
+        
         await progress_msg.edit(content=result_message)
+        
         logger.info(f'Transcribed session {session_id[:8]}')
         
     except Exception as e:
         logger.error(f'Transcription failed: {e}', exc_info=True)
-        await ctx.channel.send(f'❌ **Transcription Failed**\n```{str(e)}```')
+        await ctx.channel.send(f'❌ **Transcription Failed**\nError: ```{str(e)}```')
 
 
 @bot.slash_command(name='status', description='Show bot status')
@@ -524,12 +406,11 @@ async def status_cmd(ctx: discord.ApplicationContext):
 
 
 if __name__ == '__main__':
-    # Get token from environment
+    # Get token with fallback
     token = os.getenv('DISCORD_TOKEN')
     
-    if not token or token == 'your_discord_bot_token_here':
-        logger.error('DISCORD_TOKEN not found in .env file!')
-        logger.error('Please create .env file with: DISCORD_TOKEN=your_token_here')
+    if not token:
+        logger.error('DISCORD_TOKEN not found!')
         sys.exit(1)
     
     # Setup signal handlers
@@ -546,4 +427,3 @@ if __name__ == '__main__':
         logger.error(f'Bot crashed: {e}', exc_info=True)
     finally:
         logger.info('Bot stopped')
-```
